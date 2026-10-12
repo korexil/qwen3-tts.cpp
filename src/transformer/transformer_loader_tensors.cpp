@@ -42,15 +42,21 @@ bool transformer_internal::ops::create_tensors(TTSTransformer & self, struct ggu
         return false;
     }
 
+    const bool text_embd_cpu = env_flag_on("QWEN3_TTS_TEXT_EMBD_CPU");
     const bool qkv_dedup = env_flag_on("QWEN3_TTS_QKV_DEDUP") &&
         (packed_talker_layers > 0 || packed_code_pred_layers > 0);
+    if (text_embd_cpu) {
+        struct ggml_init_params p_cpu = { ggml_tensor_overhead() * 2, nullptr, true };
+        impl->model.ctx_cpu = ggml_init(p_cpu);
+        if (!impl->model.ctx_cpu) { error_msg = "Failed to create CPU text_embd context"; return false; }
+    }
     if (qkv_dedup) {
         struct ggml_init_params p_meta = {
             ggml_tensor_overhead() * (size_t) (3 * (cfg.n_layers + cfg.code_pred_layers) + 4), nullptr, true };
         impl->model.ctx_meta = ggml_init(p_meta);
         if (!impl->model.ctx_meta) { error_msg = "Failed to create Q/K/V meta context"; return false; }
     }
-    fprintf(stderr, "  qkv_dedup=%d\n", qkv_dedup ? 1 : 0);
+    fprintf(stderr, "  text_embd_cpu=%d qkv_dedup=%d\n", text_embd_cpu ? 1 : 0, qkv_dedup ? 1 : 0);
 
     impl->model.layers.resize(cfg.n_layers);
     impl->model.code_pred_layers.resize(cfg.code_pred_layers);
@@ -241,7 +247,9 @@ bool transformer_internal::ops::create_tensors(TTSTransformer & self, struct ggu
         }
 
         struct ggml_context * target_ctx = impl->model.ctx;
-        if (impl->model.ctx_meta &&
+        if (impl->model.ctx_cpu && strstr(name, "talker.text_embd.weight")) {
+            target_ctx = impl->model.ctx_cpu;
+        } else if (impl->model.ctx_meta &&
                    (strstr(name, "attn_q.weight") || strstr(name, "attn_k.weight") ||
                     strstr(name, "attn_v.weight")) &&
                    ((packed_talker_layers > 0 && strstr(name, "talker.blk.")) ||
@@ -443,6 +451,55 @@ bool transformer_internal::ops::load_tensor_data(TTSTransformer & self, const st
         release_preferred_backend(backend);
         return false;
     }
+    if (impl->model.ctx_cpu) {
+        const bool map_text_embd = env_flag_on("QWEN3_TTS_TEXT_EMBD_MMAP");
+        if (map_text_embd) {
+            const int64_t index = gguf_find_tensor(ctx, "talker.text_embd.weight");
+            struct ggml_tensor * tensor = impl->model.text_embd;
+            if (index < 0 || !tensor || ggml_get_first_tensor(impl->model.ctx_cpu) != tensor ||
+                    ggml_get_next_tensor(impl->model.ctx_cpu, tensor) != nullptr) {
+                error_msg = "Mapped CPU context must contain exactly the text embedding tensor";
+                release_preferred_backend(backend); return false;
+            }
+            const uint64_t data_offset = gguf_get_data_offset(ctx);
+            const uint64_t tensor_offset = gguf_get_tensor_offset(ctx, index);
+            if (tensor_offset > UINT64_MAX - data_offset) {
+                error_msg = "Text embedding offset overflow";
+                release_preferred_backend(backend); return false;
+            }
+            impl->model.text_embd_mapping = ReadonlyTensorMapping::open(
+                path, data_offset + tensor_offset, ggml_nbytes(tensor), error_msg);
+            if (!impl->model.text_embd_mapping) { release_preferred_backend(backend); return false; }
+            void * data = impl->model.text_embd_mapping->data();
+            const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+            if (reinterpret_cast<uintptr_t>(data) % alignment != 0) {
+                error_msg = "Mapped text embedding is not GGML aligned";
+                release_preferred_backend(backend); return false;
+            }
+            impl->model.buffer_cpu = ggml_backend_cpu_buffer_from_ptr(data, ggml_nbytes(tensor));
+            if (!impl->model.buffer_cpu ||
+                    ggml_backend_tensor_alloc(impl->model.buffer_cpu, tensor, data) != GGML_STATUS_SUCCESS) {
+                error_msg = "Failed to wrap read-only text embedding";
+                release_preferred_backend(backend); return false;
+            }
+            fprintf(stderr, "  read-only mapped text_embd=%zu bytes (no heap copy)\n", ggml_nbytes(tensor));
+        } else {
+            impl->model.buffer_cpu =
+                ggml_backend_alloc_ctx_tensors_from_buft(impl->model.ctx_cpu, ggml_backend_cpu_buffer_type());
+        }
+        if (!impl->model.buffer_cpu) {
+            error_msg = "Failed to allocate CPU text_embd buffer";
+            release_preferred_backend(backend);
+            return false;
+        }
+        fprintf(stderr, "  model buffer: device=%zu bytes, host text_embd=%zu bytes\n",
+                ggml_backend_buffer_get_size(impl->model.buffer),
+                ggml_backend_buffer_get_size(impl->model.buffer_cpu));
+    } else {
+        fprintf(stderr, "  model buffer: device=%zu bytes\n",
+                ggml_backend_buffer_get_size(impl->model.buffer));
+    }
+
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) {
         error_msg = "Failed to open file for reading: " + path;
@@ -465,6 +522,12 @@ bool transformer_internal::ops::load_tensor_data(TTSTransformer & self, const st
 
         struct ggml_tensor * tensor = it->second;
         size_t nbytes = ggml_nbytes(tensor);
+
+        // The mapped input is immutable; reading it into read_buf and calling
+        // tensor_set would both duplicate the table and write to read-only pages.
+        if (impl->model.text_embd_mapping && tensor == impl->model.text_embd) {
+            continue;
+        }
 
         read_buf.resize(nbytes);
 

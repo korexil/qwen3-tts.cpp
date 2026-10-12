@@ -174,11 +174,23 @@ bool transformer_internal::ops::project_text_tokens(TTSTransformer & self,
     ggml_set_input(inp_tokens);
 
     struct ggml_tensor * cur = ggml_get_rows(ctx0, impl->model.text_embd, inp_tokens);
-    cur = ggml_mul_mat(ctx0, impl->model.text_proj_fc1, cur);
-    cur = ggml_add(ctx0, cur, impl->model.text_proj_fc1_bias);
-    cur = ggml_silu(ctx0, cur);
-    cur = ggml_mul_mat(ctx0, impl->model.text_proj_fc2, cur);
-    cur = ggml_add(ctx0, cur, impl->model.text_proj_fc2_bias);
+    if (impl->model.buffer_cpu && impl->state.backend_cpu) {
+        // QWEN3_TTS_TEXT_EMBD_CPU: pin the lookup to CPU so the scheduler never uploads the whole table;
+        // only the n_tokens x text_embd_dim rows cross to the GPU projection below.
+        ggml_backend_sched_set_tensor_backend(impl->state.sched, cur, impl->state.backend_cpu);
+    }
+    const bool pin_proj_gpu = impl->model.buffer_cpu && impl->state.backend_cpu;
+    auto pin_gpu = [&](struct ggml_tensor * t) {
+        // QWEN3_TTS_TEXT_EMBD_CPU: keep the projection on the original device backend.
+        // Without this the scheduler may propagate the CPU assignment of get_rows down the chain.
+        if (pin_proj_gpu) ggml_backend_sched_set_tensor_backend(impl->state.sched, t, impl->state.backend);
+        return t;
+    };
+    cur = pin_gpu(ggml_mul_mat(ctx0, impl->model.text_proj_fc1, cur));
+    cur = pin_gpu(ggml_add(ctx0, cur, impl->model.text_proj_fc1_bias));
+    cur = pin_gpu(ggml_silu(ctx0, cur));
+    cur = pin_gpu(ggml_mul_mat(ctx0, impl->model.text_proj_fc2, cur));
+    cur = pin_gpu(ggml_add(ctx0, cur, impl->model.text_proj_fc2_bias));
 
     ggml_set_name(cur, "text_proj_out");
     ggml_set_output(cur);

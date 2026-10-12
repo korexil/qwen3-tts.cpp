@@ -39,6 +39,16 @@ void free_transformer_model(tts_transformer_model & model) {
         ggml_free(model.ctx);
         model.ctx = nullptr;
     }
+    if (model.buffer_cpu) {
+        ggml_backend_buffer_free(model.buffer_cpu);
+        model.buffer_cpu = nullptr;
+    }
+    if (model.ctx_cpu) {
+        ggml_free(model.ctx_cpu);
+        model.ctx_cpu = nullptr;
+    }
+    // The GGML from_ptr buffer above never frees its host address.
+    model.text_embd_mapping.reset();
     if (model.ctx_meta) {
         ggml_free(model.ctx_meta);
         model.ctx_meta = nullptr;

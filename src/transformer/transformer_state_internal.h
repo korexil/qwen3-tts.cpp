@@ -7,6 +7,7 @@
 #include "coreml_code_predictor.h"
 
 #include <map>
+#include "transformer/readonly_tensor_mapping.h"
 #include <string>
 #include <vector>
 #ifdef QWEN3_TTS_TIMING
@@ -126,6 +127,10 @@ struct tts_transformer_model {
 
     struct ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
+    // QWEN3_TTS_TEXT_EMBD_CPU=1: talker.text_embd lives in host RAM (get_rows runs on CPU).
+    struct ggml_context * ctx_cpu = nullptr;
+    ggml_backend_buffer_t buffer_cpu = nullptr;
+    std::unique_ptr<ReadonlyTensorMapping> text_embd_mapping;
     // QWEN3_TTS_QKV_DEDUP=1: metadata-only Q/K/V tensors (never allocated);
     // layer.attn_q/k/v become views into the packed attn_qkv tensor.
     struct ggml_context * ctx_meta = nullptr;
