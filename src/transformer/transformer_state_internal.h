@@ -126,6 +126,9 @@ struct tts_transformer_model {
 
     struct ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
+    // QWEN3_TTS_QKV_DEDUP=1: metadata-only Q/K/V tensors (never allocated);
+    // layer.attn_q/k/v become views into the packed attn_qkv tensor.
+    struct ggml_context * ctx_meta = nullptr;
 
     std::map<std::string, struct ggml_tensor *> tensors;
 };

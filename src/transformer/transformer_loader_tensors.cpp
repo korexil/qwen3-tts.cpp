@@ -2,8 +2,12 @@
 #include "transformer/transformer_state_internal.h"
 #include "gguf_loader.h"
 #include "transformer/transformer_internal.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "env_flag.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -37,6 +41,16 @@ bool transformer_internal::ops::create_tensors(TTSTransformer & self, struct ggu
         error_msg = "Failed to create GGML context";
         return false;
     }
+
+    const bool qkv_dedup = env_flag_on("QWEN3_TTS_QKV_DEDUP") &&
+        (packed_talker_layers > 0 || packed_code_pred_layers > 0);
+    if (qkv_dedup) {
+        struct ggml_init_params p_meta = {
+            ggml_tensor_overhead() * (size_t) (3 * (cfg.n_layers + cfg.code_pred_layers) + 4), nullptr, true };
+        impl->model.ctx_meta = ggml_init(p_meta);
+        if (!impl->model.ctx_meta) { error_msg = "Failed to create Q/K/V meta context"; return false; }
+    }
+    fprintf(stderr, "  qkv_dedup=%d\n", qkv_dedup ? 1 : 0);
 
     impl->model.layers.resize(cfg.n_layers);
     impl->model.code_pred_layers.resize(cfg.code_pred_layers);
@@ -226,7 +240,15 @@ bool transformer_internal::ops::create_tensors(TTSTransformer & self, struct ggu
             continue;
         }
 
-        struct ggml_tensor * tensor = ggml_new_tensor(impl->model.ctx, type, n_dims, ne);
+        struct ggml_context * target_ctx = impl->model.ctx;
+        if (impl->model.ctx_meta &&
+                   (strstr(name, "attn_q.weight") || strstr(name, "attn_k.weight") ||
+                    strstr(name, "attn_v.weight")) &&
+                   ((packed_talker_layers > 0 && strstr(name, "talker.blk.")) ||
+                    (packed_code_pred_layers > 0 && strstr(name, "code_pred.blk.")))) {
+            target_ctx = impl->model.ctx_meta;
+        }
+        struct ggml_tensor * tensor = ggml_new_tensor(target_ctx, type, n_dims, ne);
         if (!tensor) {
             error_msg = "Failed to create tensor: " + std::string(name);
             return false;
@@ -334,6 +356,24 @@ bool transformer_internal::ops::create_tensors(TTSTransformer & self, struct ggu
             }
             ggml_format_name(layer.attn_qkv,
                              "code_pred.blk.%d.attn_qkv.packed", il);
+            if (impl->model.ctx_meta) {
+                struct ggml_tensor * q = layer.attn_q;
+                struct ggml_tensor * k = layer.attn_k;
+                struct ggml_tensor * v = layer.attn_v;
+                const size_t nb1 = layer.attn_qkv->nb[1];
+                layer.attn_q = ggml_view_2d(impl->model.ctx, layer.attn_qkv, q->ne[0], q->ne[1], nb1, 0);
+                layer.attn_k = ggml_view_2d(impl->model.ctx, layer.attn_qkv, k->ne[0], k->ne[1], nb1,
+                                            (size_t) q->ne[1] * nb1);
+                layer.attn_v = ggml_view_2d(impl->model.ctx, layer.attn_qkv, v->ne[0], v->ne[1], nb1,
+                                            (size_t) (q->ne[1] + k->ne[1]) * nb1);
+                if (!layer.attn_q || !layer.attn_k || !layer.attn_v) {
+                    error_msg = "Failed to create Q/K/V views for layer " + std::to_string(il);
+                    return false;
+                }
+                ggml_format_name(layer.attn_q, "%s.view", ggml_get_name(q));
+                ggml_format_name(layer.attn_k, "%s.view", ggml_get_name(k));
+                ggml_format_name(layer.attn_v, "%s.view", ggml_get_name(v));
+            }
         }
     }
 
@@ -365,6 +405,24 @@ bool transformer_internal::ops::create_tensors(TTSTransformer & self, struct ggu
                 return false;
             }
             ggml_format_name(layer.attn_qkv, "talker.blk.%d.attn_qkv.packed", il);
+            if (impl->model.ctx_meta) {
+                struct ggml_tensor * q = layer.attn_q;
+                struct ggml_tensor * k = layer.attn_k;
+                struct ggml_tensor * v = layer.attn_v;
+                const size_t nb1 = layer.attn_qkv->nb[1];
+                layer.attn_q = ggml_view_2d(impl->model.ctx, layer.attn_qkv, q->ne[0], q->ne[1], nb1, 0);
+                layer.attn_k = ggml_view_2d(impl->model.ctx, layer.attn_qkv, k->ne[0], k->ne[1], nb1,
+                                            (size_t) q->ne[1] * nb1);
+                layer.attn_v = ggml_view_2d(impl->model.ctx, layer.attn_qkv, v->ne[0], v->ne[1], nb1,
+                                            (size_t) (q->ne[1] + k->ne[1]) * nb1);
+                if (!layer.attn_q || !layer.attn_k || !layer.attn_v) {
+                    error_msg = "Failed to create Q/K/V views for layer " + std::to_string(il);
+                    return false;
+                }
+                ggml_format_name(layer.attn_q, "%s.view", ggml_get_name(q));
+                ggml_format_name(layer.attn_k, "%s.view", ggml_get_name(k));
+                ggml_format_name(layer.attn_v, "%s.view", ggml_get_name(v));
+            }
         }
     }
 
@@ -385,7 +443,6 @@ bool transformer_internal::ops::load_tensor_data(TTSTransformer & self, const st
         release_preferred_backend(backend);
         return false;
     }
-
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) {
         error_msg = "Failed to open file for reading: " + path;
@@ -429,7 +486,9 @@ bool transformer_internal::ops::load_tensor_data(TTSTransformer & self, const st
             return false;
         }
 
-        ggml_backend_tensor_set(tensor, read_buf.data(), 0, nbytes);
+        if (tensor->buffer) {  // metadata-only Q/K/V (QKV_DEDUP) have no buffer; packed copy below
+            ggml_backend_tensor_set(tensor, read_buf.data(), 0, nbytes);
+        }
 
         int layer_idx = -1;
         if (sscanf(name, "code_pred.blk.%d.", &layer_idx) == 1 &&

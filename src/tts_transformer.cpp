@@ -39,6 +39,10 @@ void free_transformer_model(tts_transformer_model & model) {
         ggml_free(model.ctx);
         model.ctx = nullptr;
     }
+    if (model.ctx_meta) {
+        ggml_free(model.ctx_meta);
+        model.ctx_meta = nullptr;
+    }
     model.tensors.clear();
     model.layers.clear();
     model.code_pred_layers.clear();
