@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
@@ -118,6 +119,72 @@ bool parse_int32_value(const char * start, char ** end, int32_t & value) {
     return true;
 }
 
+// JSON \uXXXX escapes: four hex digits, or two escapes forming a UTF-16 surrogate pair.
+// Standard JSON writers (Python's json.dumps, Java, Go) escape every non-ASCII character
+// this way, so a prompt they wrote used to reach the talker as the literal text "u7684".
+bool parse_hex4(const std::string & text, size_t pos, uint32_t & out) {
+    if (pos + 4 > text.size()) {
+        return false;
+    }
+    out = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        const char c = text[pos + i];
+        uint32_t digit;
+        if (c >= '0' && c <= '9') {
+            digit = (uint32_t) (c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = (uint32_t) (c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            digit = (uint32_t) (c - 'A' + 10);
+        } else {
+            return false;
+        }
+        out = (out << 4) | digit;
+    }
+    return true;
+}
+
+void append_utf8(std::string & value, uint32_t codepoint) {
+    if (codepoint < 0x80) {
+        value.push_back((char) codepoint);
+    } else if (codepoint < 0x800) {
+        value.push_back((char) (0xC0 | (codepoint >> 6)));
+        value.push_back((char) (0x80 | (codepoint & 0x3F)));
+    } else if (codepoint < 0x10000) {
+        value.push_back((char) (0xE0 | (codepoint >> 12)));
+        value.push_back((char) (0x80 | ((codepoint >> 6) & 0x3F)));
+        value.push_back((char) (0x80 | (codepoint & 0x3F)));
+    } else {
+        value.push_back((char) (0xF0 | (codepoint >> 18)));
+        value.push_back((char) (0x80 | ((codepoint >> 12) & 0x3F)));
+        value.push_back((char) (0x80 | ((codepoint >> 6) & 0x3F)));
+        value.push_back((char) (0x80 | (codepoint & 0x3F)));
+    }
+}
+
+// Consumes the hex digits after a "\u" at `pos` (and a following "\uDCxx" low surrogate
+// when the first one is a high surrogate); returns false on malformed input.
+bool parse_unicode_escape(const std::string & text, size_t & pos, std::string & value) {
+    uint32_t codepoint;
+    if (!parse_hex4(text, pos, codepoint)) {
+        return false;
+    }
+    pos += 4;
+    if (codepoint >= 0xD800 && codepoint <= 0xDBFF) {
+        uint32_t low;
+        if (pos + 6 > text.size() || text[pos] != '\\' || text[pos + 1] != 'u' ||
+            !parse_hex4(text, pos + 2, low) || low < 0xDC00 || low > 0xDFFF) {
+            return false;
+        }
+        pos += 6;
+        codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+    } else if (codepoint >= 0xDC00 && codepoint <= 0xDFFF) {
+        return false;
+    }
+    append_utf8(value, codepoint);
+    return true;
+}
+
 bool parse_json_string_field(const std::string & text, const char * key, std::string & value) {
     const size_t key_pos = find_key(text, key);
     if (key_pos == std::string::npos) {
@@ -155,6 +222,11 @@ bool parse_json_string_field(const std::string & text, const char * key, std::st
             case 'n': value.push_back('\n'); break;
             case 'r': value.push_back('\r'); break;
             case 't': value.push_back('\t'); break;
+            case 'u':
+                if (!parse_unicode_escape(text, pos, value)) {
+                    return false;
+                }
+                break;
             default: value.push_back(esc); break;
         }
     }
